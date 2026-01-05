@@ -78,7 +78,7 @@ class ShapedMBTilesPlugin:
         activate_shaped_tool()
 ```
 
-4. **Copy the main script**: Copy `mbtiles/shaped_mbtiles_clipping.py` from this repository into your `shaped_mbtiles` folder and rename it to `shaped_mbtiles.py`.
+4. **Copy the main script**: Copy `mbtiles/shaped_mbtiles.py` from this repository into your `shaped_mbtiles` folder.
 
 5. **Edit the script**: Open `shaped_mbtiles.py` in a text editor. Scroll to the very bottom of the file (around line 489-511). You'll see code that looks like this:
 
@@ -116,9 +116,8 @@ If you don't want to set up a plugin, just load the script directly:
 
 1. Open QGIS
 2. Go to **Plugins** → **Python Console**
-3. Run this (replace with your actual file path):
-```python
-exec(open(r'C:\Users\A\Desktop\shogl\mbtiles\shaped_mbtiles_clipping.py').read())
+3. Show editor
+4. Paste the contents of the python file and click run
 ```
 
 A toolbar button will appear. Click it to start drawing polygons.
