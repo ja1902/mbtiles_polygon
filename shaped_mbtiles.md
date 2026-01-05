@@ -1,5 +1,3 @@
-# shaped_mbtiles_clipping.py
-
 QGIS plugin that generates MBTiles from a polygon you draw. Only creates tiles that actually intersect your shape, so no wasted tiles. Uses clipping approach for efficient rendering.
 
 ## Features
@@ -65,3 +63,4 @@ The renderer uses `painter.setClipPath()` to restrict rendering to only the poly
 - QGIS 3.0+
 - Python 3.x (comes with QGIS)
 - PyQt5 (included with QGIS)
+
