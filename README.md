@@ -11,6 +11,8 @@ Generate MBTiles from a polygon you draw on the map. Only creates tiles that act
 - Three mask options: transparent, white, or black outside polygon
 - Shows tile count estimate before generating
 
+You can find more info on how it works in the shaped_mbtiles.md file.
+
 ## Installation
 
 ### Option 1: Install as Plugin
