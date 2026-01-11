@@ -23,6 +23,14 @@ RENDER_SIZE = 384  # Render larger for meta-tiling (prevents label clipping)
 WORLD_CIRCUMFERENCE = 40075016.686
 ORIGIN_SHIFT = 20037508.342789244
 
+# Global state to persist drawing between pause/resume
+_drawing_state = {
+    'points': [],
+    'paused': False,
+    'tool': None,
+    'rubber_band': None
+}
+
 # ======================================================
 # 1. TILE MATH UTILITIES
 # ======================================================
@@ -368,19 +376,33 @@ class ShapedTileConfigDialog(QDialog):
 # 5. DRAW TOOL
 # ======================================================
 class ShapedMBTilesTool(QgsMapTool):
-    def __init__(self, canvas):
+    def __init__(self, canvas, resume_points=None):
         self.canvas = canvas
         QgsMapTool.__init__(self, self.canvas)
         self.rubberBand = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
         self.rubberBand.setColor(QColor(50, 200, 50, 180))
         self.rubberBand.setWidth(3)
-        self.points = []
+        
+        # If resuming, restore points
+        if resume_points:
+            self.points = resume_points
+            for pt in self.points:
+                self.rubberBand.addPoint(pt)
+        else:
+            self.points = []
+        
+        # Store reference globally
+        _drawing_state['tool'] = self
+        _drawing_state['rubber_band'] = self.rubberBand
+        _drawing_state['paused'] = False
 
     def canvasPressEvent(self, e):
         if e.button() == Qt.LeftButton:
             point = self.toMapCoordinates(e.pos())
             self.points.append(point)
             self.rubberBand.addPoint(point)
+            # Keep global state in sync
+            _drawing_state['points'] = self.points
         elif e.button() == Qt.RightButton:
             if len(self.points) > 2:
                 self.finish_drawing()
@@ -390,6 +412,40 @@ class ShapedMBTilesTool(QgsMapTool):
         self.points = []
         self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
         self.canvas.unsetMapTool(self)
+        # Clear global state
+        _drawing_state['points'] = []
+        _drawing_state['paused'] = False
+        _drawing_state['tool'] = None
+        _drawing_state['rubber_band'] = None
+
+    def pause(self):
+        """Pause drawing - keep points but release the tool"""
+        _drawing_state['points'] = self.points.copy()
+        _drawing_state['paused'] = True
+        _drawing_state['intentional_pause'] = True  # Flag to prevent deactivate cleanup
+        # Don't reset rubber band - keep it visible
+        self.canvas.unsetMapTool(self)
+        iface.messageBar().pushMessage(
+            "Drawing Paused", 
+            f"{len(self.points)} points saved. Click 'Resume Drawing' to continue.",
+            level=0, duration=3
+        )
+
+    def deactivate(self):
+        """Called when tool is deactivated (user switches to another tool)"""
+        # If this wasn't an intentional pause, clean up everything
+        if not _drawing_state.get('intentional_pause', False):
+            self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
+            _drawing_state['points'] = []
+            _drawing_state['paused'] = False
+            _drawing_state['tool'] = None
+            _drawing_state['rubber_band'] = None
+            # Update button text back to default
+            if _pause_action:
+                _pause_action.setText("Pause Drawing")
+        # Reset the flag
+        _drawing_state['intentional_pause'] = False
+        QgsMapTool.deactivate(self)
 
     def finish_drawing(self):
         poly_geom = QgsGeometry.fromPolygonXY([self.points])
@@ -476,21 +532,79 @@ class ShapedMBTilesTool(QgsMapTool):
 # ======================================================
 # 6. LAUNCH
 # ======================================================
+
+# Store action reference for updating button text
+_pause_action = None
+
+def update_pause_button_text():
+    """Update the pause/resume button text based on current state"""
+    global _pause_action
+    if _pause_action:
+        if _drawing_state['paused']:
+            _pause_action.setText("Resume Drawing")
+        elif _drawing_state['tool'] and _drawing_state['points']:
+            _pause_action.setText("Pause Drawing")
+        else:
+            _pause_action.setText("Pause Drawing")
+
 def activate_shaped_tool():
+    """Start a new drawing"""
+    # If there's an existing paused drawing, clear it first
+    if _drawing_state['paused'] and _drawing_state['rubber_band']:
+        _drawing_state['rubber_band'].reset(QgsWkbTypes.PolygonGeometry)
+        _drawing_state['points'] = []
+        _drawing_state['paused'] = False
+    
     tool = ShapedMBTilesTool(iface.mapCanvas())
     iface.mapCanvas().setMapTool(tool)
+    update_pause_button_text()
 
-action_name = "Draw Shaped MBTiles"
+def toggle_pause_resume():
+    """Toggle between pause and resume drawing"""
+    if _drawing_state['paused'] and _drawing_state['points']:
+        # Currently paused - RESUME
+        if _drawing_state['rubber_band']:
+            _drawing_state['rubber_band'].reset(QgsWkbTypes.PolygonGeometry)
+        tool = ShapedMBTilesTool(iface.mapCanvas(), resume_points=_drawing_state['points'])
+        iface.mapCanvas().setMapTool(tool)
+        iface.messageBar().pushMessage(
+            "Drawing Resumed", 
+            f"Continuing with {len(_drawing_state['points'])} points.",
+            level=0, duration=2
+        )
+        update_pause_button_text()
+    elif _drawing_state['tool'] and _drawing_state['points']:
+        # Currently drawing - PAUSE
+        _drawing_state['tool'].pause()
+        update_pause_button_text()
+    else:
+        iface.messageBar().pushMessage(
+            "No Drawing", 
+            "Start drawing first with 'Draw Shaped MBTiles'.", 
+            level=1, duration=2
+        )
+
+# Setup toolbar buttons
 main_window = iface.mainWindow()
 
-for a in main_window.findChildren(QAction):
-    if a.text() == action_name:
-        iface.removeToolBarIcon(a)
-        a.deleteLater()
+# Remove old actions if they exist
+for action_text in ["Draw Shaped MBTiles", "Pause/Cancel Drawing", "Pause Drawing", "Resume Drawing"]:
+    for a in main_window.findChildren(QAction):
+        if a.text() == action_text:
+            iface.removeToolBarIcon(a)
+            a.deleteLater()
 
-action = QAction(action_name, main_window)
-action.triggered.connect(activate_shaped_tool)
-iface.addToolBarIcon(action)
+# Add Draw button (starts new drawing)
+draw_action = QAction("Draw Shaped MBTiles", main_window)
+draw_action.triggered.connect(activate_shaped_tool)
+iface.addToolBarIcon(draw_action)
+
+# Add Pause/Resume toggle button
+_pause_action = QAction("Pause Drawing", main_window)
+_pause_action.triggered.connect(toggle_pause_resume)
+iface.addToolBarIcon(_pause_action)
+
 print("Shaped MBTiles Tool loaded!")
-print("- Only generates tiles that intersect your polygon")
-print("- No wasted tiles outside your shape")
+print("- Click 'Draw Shaped MBTiles' to start a new drawing")
+print("- Click 'Pause Drawing' to pause, then same button to resume")
+print("- Left-click to add points, right-click to finish")
