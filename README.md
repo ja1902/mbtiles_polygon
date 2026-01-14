@@ -126,7 +126,7 @@ If you don't want to set up a plugin, just load the script directly:
 2. Go to **Plugins** → **Python Console**
 3. Show editor
 4. Paste the contents of the python file and click run
-```
+
 
 A toolbar button will appear. Click it to start drawing polygons.
 
@@ -183,3 +183,4 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
+
