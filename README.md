@@ -5,11 +5,17 @@ Generate MBTiles from a polygon you draw on the map. Only creates tiles that act
 ## Features
 
 - Draw any polygon shape, generate tiles for just that area
+- **Pause/Resume drawing** - pause to pan/zoom, then resume where you left off
+- **Undo last point** - Delete/Backspace key, Shift+Right-click, or middle-click
+- **ESC to exit** - Press ESC to cancel and exit drawing mode
 - Pre-filters tiles before rendering - only intersecting tiles are created
 - Uses clipping to render only pixels inside the polygon (more efficient)
-- Meta-tiling prevents labels from being cut off at edges
-- Three mask options: transparent, white, or black outside polygon
-- Shows tile count estimate before generating
+- **Configurable metatile size** - prevents labels from being cut off at edges
+- **Standard QGIS options** - DPI, antialiasing, tile format (PNG/JPG), background color
+- **JPEG quality control** (1-100%, default 75)
+- **Time remaining estimate** during generation
+- **Keyboard shortcuts** for quick access
+- **Batch database commits** for better performance
 
 You can find more info on how it works in the shaped_mbtiles.md file.
 
@@ -120,23 +126,48 @@ If you don't want to set up a plugin, just load the script directly:
 2. Go to **Plugins** → **Python Console**
 3. Show editor
 4. Paste the contents of the python file and click run
+```
 
 A toolbar button will appear. Click it to start drawing polygons.
 
 ## Usage
 
 1. Load your map layers in QGIS
-2. Click the toolbar button or go to Plugins → Shaped MBTiles
-3. Left-click to draw polygon vertices, right-click to finish
-4. Set zoom levels, mask style, and output file
-5. Check the tile count estimate
-6. Click OK and wait for it to finish
+2. Click the toolbar button **"Draw Shaped MBTiles"** (or press **Ctrl+Shift+M**)
+3. **Draw your polygon:**
+   - **Left-click** to add polygon vertices
+   - **Delete/Backspace** or **Shift+Right-click** or **Middle-click** to undo the last point
+   - **Right-click** to finish and open export dialog
+   - **ESC** to cancel and exit drawing mode
+4. **Pause if needed:**
+   - Click **"Pause Drawing"** button (or press **Ctrl+Shift+P**) to pause
+   - Pan/zoom the map as needed
+   - Click **"Resume Drawing"** (same button) to continue
+5. **Configure export:**
+   - Set zoom levels (min/max)
+   - Set DPI (48-384, default: 96)
+   - Optionally select a background color
+   - Enable/disable antialiasing
+   - Choose tile format (PNG or JPG)
+   - Adjust JPEG quality if using JPG (1-100%, default: 75)
+   - Set metatile size (1-20, default: 4)
+   - Select output file location
+6. Click OK and wait for generation to complete
+   - Progress bar shows time remaining estimate
+   - You can cancel at any time
 
 ## Tips
 
 - Layers should be in Web Mercator (EPSG:3857) for best results
 - Start with a small zoom range to test (e.g., 10-12)
-- Transparent mask = PNG, solid colors = JPEG
+- Use **PNG** for transparent backgrounds, **JPG** for smaller file sizes
+- Use **Pause Drawing** (Ctrl+Shift+P) if you need to navigate the map while drawing complex polygons
+- Press **ESC** to quickly exit drawing mode
+- **Delete/Backspace** keys are the easiest way to undo the last point
+- Lower JPEG quality (30-50) for smaller files, higher (75-95) for better quality
+- Higher DPI (e.g., 192) creates sharper tiles but increases file size
+- Metatile size of 4 is good for preventing label clipping; increase if labels still get cut off
+- Disable antialiasing for faster generation if visual quality isn't critical
 
 ## Troubleshooting
 
@@ -152,4 +183,3 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
-
