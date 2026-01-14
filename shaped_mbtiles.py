@@ -1,6 +1,36 @@
+"""
+Shaped MBTiles Generator for QGIS
+
+Interactive tool for generating MBTiles from user-drawn polygons. Uses spatial
+filtering (only renders intersecting tiles) and painter-based clipping for efficient
+tile generation.
+
+Key features:
+- Draw arbitrary polygon shapes on the map
+- Pre-filter tiles by spatial intersection before rendering
+- Render tiles with polygon clipping using QPainterPath
+- Meta-tiling to prevent label clipping at tile edges
+- Pause/resume drawing functionality
+- Standard QGIS MBTiles options (DPI, format, quality, etc.)
+- Progress tracking with time estimates
+- Batch database commits for performance
+
+Architecture:
+1. Tile math utilities - coordinate conversions and spatial filtering
+2. MBTilesWriter - SQLite database with MBTiles schema
+3. ShapedTileRenderer - renders tiles with polygon clipping
+4. ShapedTileConfigDialog - configuration UI
+5. ShapedMBTilesTool - interactive drawing tool
+6. Launch code - toolbar buttons and keyboard shortcuts
+
+See shaped_mbtiles.md for detailed technical documentation.
+See README.md for user documentation.
+"""
+
 import os
 import math
 import sqlite3
+import time
 from io import BytesIO
 from qgis.core import (QgsProject, QgsVectorLayer, QgsGeometry, 
                        QgsFeature, QgsMapSettings, QgsMapRendererCustomPainterJob,
@@ -9,38 +39,61 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsGeometry,
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.utils import iface
 from PyQt5.QtCore import Qt, QSize, QBuffer, QIODevice, QByteArray
-from PyQt5.QtGui import QColor, QImage, QPainter, QPainterPath
+from PyQt5.QtGui import QColor, QImage, QPainter, QPainterPath, QKeyEvent
 from PyQt5.QtWidgets import (QAction, QDialog, QSpinBox, QPushButton, 
                              QFileDialog, QFormLayout, QDialogButtonBox, 
                              QLabel, QProgressDialog, QComboBox, QMessageBox,
-                             QApplication)
+                             QApplication, QCheckBox, QColorDialog)
 
 # ======================================================
 # CONSTANTS
 # ======================================================
-TILE_SIZE = 256
-RENDER_SIZE = 384  # Render larger for meta-tiling (prevents label clipping)
-WORLD_CIRCUMFERENCE = 40075016.686
-ORIGIN_SHIFT = 20037508.342789244
+TILE_SIZE = 256  # Standard web map tile size (TMS specification)
+ORIGIN_SHIFT = 20037508.342789244  # Web Mercator (EPSG:3857) extent in meters
+WORLD_CIRCUMFERENCE = 40075016.686  # Earth's circumference at equator in meters
 
-# Global state to persist drawing between pause/resume
+# Global state to persist drawing between pause/resume cycles
+# This dict allows the drawing tool to be deactivated (for pan/zoom) while
+# preserving the polygon points and rubber band. When resuming, a new tool
+# instance reads this state to continue where the user left off.
 _drawing_state = {
-    'points': [],
-    'paused': False,
-    'tool': None,
-    'rubber_band': None
+    'points': [],              # List of QgsPointXY vertices
+    'paused': False,           # True when drawing is paused
+    'tool': None,             # Reference to active ShapedMBTilesTool instance
+    'rubber_band': None,      # Reference to QgsRubberBand for visual feedback
+    'intentional_pause': False # Flag to distinguish pause from accidental tool switch
 }
 
 # ======================================================
 # 1. TILE MATH UTILITIES
 # ======================================================
 def lon_lat_to_meters(lon, lat):
+    """
+    Convert WGS84 longitude/latitude to Web Mercator meters.
+    
+    Args:
+        lon: Longitude in degrees (-180 to 180)
+        lat: Latitude in degrees (-85.05 to 85.05 for Web Mercator)
+    
+    Returns:
+        Tuple of (mx, my) in meters from origin
+    """
     mx = lon * ORIGIN_SHIFT / 180.0
     my = math.log(math.tan((90 + lat) * math.pi / 360.0)) / (math.pi / 180.0)
     my = my * ORIGIN_SHIFT / 180.0
     return mx, my
 
 def meters_to_tile(mx, my, zoom):
+    """
+    Convert Web Mercator meters to XYZ tile coordinates at given zoom level.
+    
+    Args:
+        mx, my: Coordinates in Web Mercator meters
+        zoom: Zoom level (0-22)
+    
+    Returns:
+        Tuple of (tile_x, tile_y) in XYZ coordinates
+    """
     resolution = WORLD_CIRCUMFERENCE / (TILE_SIZE * (2 ** zoom))
     px = (mx + ORIGIN_SHIFT) / resolution
     py = (ORIGIN_SHIFT - my) / resolution
@@ -49,6 +102,15 @@ def meters_to_tile(mx, my, zoom):
     return tx, ty
 
 def tile_to_extent(z, x, y):
+    """
+    Calculate the geographic extent of a tile in Web Mercator meters.
+    
+    Args:
+        z, x, y: XYZ tile coordinates
+    
+    Returns:
+        QgsRectangle representing the tile's extent
+    """
     tile_size_meters = WORLD_CIRCUMFERENCE / (2 ** z)
     x_min = x * tile_size_meters - ORIGIN_SHIFT
     x_max = (x + 1) * tile_size_meters - ORIGIN_SHIFT
@@ -57,29 +119,62 @@ def tile_to_extent(z, x, y):
     return QgsRectangle(x_min, y_min, x_max, y_max)
 
 def tile_to_geometry(z, x, y):
+    """
+    Convert tile coordinates to a QgsGeometry polygon in Web Mercator.
+    
+    Args:
+        z, x, y: XYZ tile coordinates
+    
+    Returns:
+        QgsGeometry representing the tile as a rectangle
+    """
     extent = tile_to_extent(z, x, y)
     return QgsGeometry.fromRect(extent)
 
 def get_intersecting_tiles(polygon_geom, source_crs, zoom_min, zoom_max):
+    """
+    Calculate all tiles that spatially intersect a polygon across zoom levels.
+    
+    This is a two-stage process:
+    1. Transform polygon to Web Mercator
+    2. For each zoom level:
+       - Calculate tile range from bounding box
+       - Test each candidate tile for intersection
+       - Keep only tiles that actually intersect
+    
+    Args:
+        polygon_geom: QgsGeometry polygon in source_crs
+        source_crs: QgsCoordinateReferenceSystem of the polygon
+        zoom_min, zoom_max: Zoom level range (inclusive)
+    
+    Returns:
+        Tuple of:
+        - List of (z, x, y) tuples for intersecting tiles
+        - Transformed polygon in Web Mercator (EPSG:3857)
+    """
     web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
     transform = QgsCoordinateTransform(source_crs, web_mercator, QgsProject.instance())
     
+    # Transform polygon to Web Mercator for tile calculations
     poly_3857 = QgsGeometry(polygon_geom)
     poly_3857.transform(transform)
     
     tiles = []
     bbox = poly_3857.boundingBox()
     
+    # For each zoom level, find tiles in bounding box and test for intersection
     for z in range(zoom_min, zoom_max + 1):
         x_min, y_min = meters_to_tile(bbox.xMinimum(), bbox.yMaximum(), z)
         x_max, y_max = meters_to_tile(bbox.xMaximum(), bbox.yMinimum(), z)
         
+        # Clamp to valid tile range for this zoom level
         max_tile = (2 ** z) - 1
         x_min = max(0, x_min)
         x_max = min(max_tile, x_max)
         y_min = max(0, y_min)
         y_max = min(max_tile, y_max)
         
+        # Test each candidate tile for actual intersection with polygon
         for x in range(x_min, x_max + 1):
             for y in range(y_min, y_max + 1):
                 tile_geom = tile_to_geometry(z, x, y)
@@ -92,8 +187,32 @@ def get_intersecting_tiles(polygon_geom, source_crs, zoom_min, zoom_max):
 # 2. MBTILES DATABASE HANDLER
 # ======================================================
 class MBTilesWriter:
+    """
+    Writes tiles to an MBTiles SQLite database.
+    
+    Handles:
+    - Schema initialization (tiles and metadata tables)
+    - Metadata writing (name, bounds, format, zoom levels, etc.)
+    - Tile writing with XYZ to TMS coordinate conversion
+    - Batch commits for performance
+    - Database cleanup (VACUUM on close)
+    
+    MBTiles spec: https://github.com/mapbox/mbtiles-spec
+    """
+    
     def __init__(self, path, name="Shaped Export", description="Generated by QGIS", 
                  tile_format="png", bounds=None, min_zoom=0, max_zoom=14):
+        """
+        Initialize MBTiles database.
+        
+        Args:
+            path: Output file path (.mbtiles)
+            name: Tileset name for metadata
+            description: Tileset description for metadata
+            tile_format: "png" or "jpg"
+            bounds: WGS84 bounds tuple (lon_min, lat_min, lon_max, lat_max)
+            min_zoom, max_zoom: Zoom level range
+        """
         self.path = path
         self.conn = sqlite3.connect(path)
         self.cursor = self.conn.cursor()
@@ -130,6 +249,11 @@ class MBTilesWriter:
         }
         if bounds:
             metadata['bounds'] = f"{bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}"
+            # Add center point (lon, lat, zoom)
+            center_lon = (bounds[0] + bounds[2]) / 2
+            center_lat = (bounds[1] + bounds[3]) / 2
+            center_zoom = (min_zoom + max_zoom) // 2
+            metadata['center'] = f"{center_lon},{center_lat},{center_zoom}"
         
         for key, value in metadata.items():
             self.cursor.execute(
@@ -139,6 +263,17 @@ class MBTilesWriter:
         self.conn.commit()
     
     def write_tile(self, z, x, y, image_data):
+        """
+        Write a single tile to the database.
+        
+        Converts XYZ coordinates to TMS (flips Y axis) as required by MBTiles spec.
+        Uses INSERT OR REPLACE to overwrite existing tiles.
+        
+        Args:
+            z, x, y: XYZ tile coordinates
+            image_data: Tile image as bytes (PNG or JPEG)
+        """
+        # Convert XYZ (origin top-left) to TMS (origin bottom-left)
         tms_y = (2 ** z) - 1 - y
         self.cursor.execute(
             "INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
@@ -158,28 +293,71 @@ class MBTilesWriter:
 # ======================================================
 class ShapedTileRenderer:
     """
-    Renders tiles with polygon clipping.
+    Renders map tiles with polygon clipping using QPainter paths.
     
-    Flow:
-    1. Fill background with mask color
-    2. Set clip path to polygon
-    3. Render map (only renders within clip)
+    Rendering approach:
+    1. Create image buffer with background color
+    2. Set QPainter clip path to polygon (if needed)
+    3. Render map layers - only pixels inside clip path are drawn
+    4. Crop to final tile size (if using metatiling)
+    
+    Optimizations:
+    - Skips clipping for tiles fully inside polygon (containment test)
+    - Uses meta-tiling to prevent label clipping at tile edges
+    - Configurable DPI and antialiasing for quality/speed trade-offs
     """
     
-    def __init__(self, polygon_geom_3857, mask_style=0):
+    def __init__(self, polygon_geom_3857, tile_format='png', background_color=None, 
+                 dpi=96, antialias=True, metatile_size=4):
+        """
+        Initialize renderer.
+        
+        Args:
+            polygon_geom_3857: QgsGeometry polygon in Web Mercator (EPSG:3857)
+            tile_format: "png" or "jpg"
+            background_color: QColor for background (None = transparent for PNG, white for JPG)
+            dpi: Dots per inch for rendering (48-384)
+            antialias: Enable antialiasing (slower but smoother)
+            metatile_size: Render multiplier for edge buffering (1-20, default 4)
+        """
         self.polygon = polygon_geom_3857
-        self.mask_style = mask_style
+        self.tile_format = tile_format
+        self.background_color = background_color
+        self.dpi = dpi
+        self.antialias = antialias
+        self.metatile_size = metatile_size
         self.web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
         
     def render_tile(self, z, x, y, layers):
+        """
+        Render a single tile with polygon clipping.
+        
+        Process:
+        1. Calculate tile extent and check if fully inside polygon
+        2. Calculate render size with metatile buffer
+        3. Create image buffer with background
+        4. Set clip path if needed (tiles crossing polygon boundary)
+        5. Render map with QgsMapRendererCustomPainterJob
+        6. Crop to final 256×256 tile size
+        
+        Args:
+            z, x, y: XYZ tile coordinates
+            layers: List of QgsMapLayers to render
+        
+        Returns:
+            QImage of size 256×256 pixels
+        """
         extent = tile_to_extent(z, x, y)
         tile_geom = QgsGeometry.fromRect(extent)
         
-        # Check if tile is fully inside polygon (no clipping needed)
+        # Optimization: Skip clipping overhead for tiles fully inside polygon
         tile_fully_inside = self.polygon.contains(tile_geom)
         
+        # Calculate render size based on metatile size
+        render_size = TILE_SIZE * self.metatile_size
+        
         # Calculate expanded extent for meta-tiling
-        buffer_ratio = (RENDER_SIZE - TILE_SIZE) / (2 * TILE_SIZE)
+        buffer_ratio = (render_size - TILE_SIZE) / (2 * TILE_SIZE)
         expand_x = extent.width() * buffer_ratio
         expand_y = extent.height() * buffer_ratio
         render_extent = QgsRectangle(
@@ -191,28 +369,40 @@ class ShapedTileRenderer:
         
         # Setup map settings
         settings = QgsMapSettings()
-        settings.setOutputSize(QSize(RENDER_SIZE, RENDER_SIZE))
+        settings.setOutputSize(QSize(render_size, render_size))
+        settings.setOutputDpi(self.dpi)
         settings.setExtent(render_extent)
         settings.setDestinationCrs(self.web_mercator)
         settings.setLayers(layers)
-        settings.setFlag(QgsMapSettings.Antialiasing, True)
-        settings.setFlag(QgsMapSettings.UseAdvancedEffects, True)
+        settings.setFlag(QgsMapSettings.Antialiasing, self.antialias)
+        settings.setFlag(QgsMapSettings.UseAdvancedEffects, self.antialias)
+        
+        # Determine background color
+        if self.background_color:
+            bg_color = self.background_color
+        else:
+            # Default to transparent for PNG, white for JPG
+            bg_color = Qt.transparent if self.tile_format == 'png' else QColor("white")
         
         # Create image with appropriate format
-        if self.mask_style == 0:  # Transparent
-            render_image = QImage(RENDER_SIZE, RENDER_SIZE, QImage.Format_ARGB32)
+        if self.tile_format == 'png' and not self.background_color:
+            render_image = QImage(render_size, render_size, QImage.Format_ARGB32)
             render_image.fill(Qt.transparent)
         else:
-            render_image = QImage(RENDER_SIZE, RENDER_SIZE, QImage.Format_RGB32)
-            bg_color = QColor("white") if self.mask_style == 1 else QColor("black")
+            render_image = QImage(render_size, render_size, QImage.Format_RGB32)
             render_image.fill(bg_color)
         
+        # Set DPI for the image
+        render_image.setDotsPerMeterX(int(self.dpi / 0.0254))
+        render_image.setDotsPerMeterY(int(self.dpi / 0.0254))
+        
         painter = QPainter(render_image)
-        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self.antialias:
+            painter.setRenderHint(QPainter.Antialiasing, True)
         
         # If tile is NOT fully inside, set clip path BEFORE rendering
         if not tile_fully_inside:
-            clip_path = self._get_clip_path(render_extent)
+            clip_path = self._get_clip_path(render_extent, render_size)
             if clip_path:
                 painter.setClipPath(clip_path)
         
@@ -224,23 +414,52 @@ class ShapedTileRenderer:
         painter.end()
         
         # Crop to final tile size
-        buffer_px = (RENDER_SIZE - TILE_SIZE) // 2
+        buffer_px = (render_size - TILE_SIZE) // 2
         final_image = render_image.copy(buffer_px, buffer_px, TILE_SIZE, TILE_SIZE)
         
         return final_image
     
-    def _get_clip_path(self, extent):
-        """Get the polygon clip path for this extent"""
+    def _get_clip_path(self, extent, render_size):
+        """
+        Calculate QPainterPath for clipping this tile to the polygon.
+        
+        Process:
+        1. Intersect polygon with render extent
+        2. Convert resulting geometry to QPainterPath in pixel coordinates
+        
+        Args:
+            extent: QgsRectangle of render area in Web Mercator meters
+            render_size: Size of render buffer in pixels
+        
+        Returns:
+            QPainterPath for clipping, or None if no intersection
+        """
         render_geom = QgsGeometry.fromRect(extent)
         clipped = self.polygon.intersection(render_geom)
         
         if clipped.isEmpty():
-            # Completely outside - return None (nothing to render)
+            # Tile is entirely outside polygon - nothing to render
             return None
         
-        return self._geometry_to_path(clipped, extent, RENDER_SIZE)
+        return self._geometry_to_path(clipped, extent, render_size)
     
     def _geometry_to_path(self, geom, extent, image_size=TILE_SIZE):
+        """
+        Convert QgsGeometry polygon to QPainterPath in pixel coordinates.
+        
+        Handles:
+        - Single polygons and multipolygons
+        - Outer rings and holes (inner rings)
+        - Coordinate transformation from meters to pixels
+        
+        Args:
+            geom: QgsGeometry in Web Mercator meters
+            extent: QgsRectangle defining the geographic extent
+            image_size: Size of image in pixels
+        
+        Returns:
+            QPainterPath with polygon(s) in pixel coordinates
+        """
         path = QPainterPath()
         
         x_scale = image_size / extent.width()
@@ -277,54 +496,119 @@ class ShapedTileRenderer:
 # 4. CONFIGURATION DIALOG
 # ======================================================
 class ShapedTileConfigDialog(QDialog):
+    """
+    Configuration dialog for shaped MBTiles export.
+    
+    Provides standard QGIS MBTiles options:
+    - Zoom level range (min/max)
+    - DPI for rendering
+    - Optional background color
+    - Antialiasing toggle
+    - Tile format (PNG/JPG)
+    - JPEG quality (when using JPG)
+    - Metatile size for edge buffering
+    - Output file selection
+    
+    Validates inputs (min <= max zoom) before accepting.
+    """
+    
     def __init__(self, polygon_geometry, parent=None):
+        """
+        Initialize configuration dialog.
+        
+        Args:
+            polygon_geometry: QgsGeometry of drawn polygon
+            parent: Parent widget (typically iface.mainWindow())
+        """
         super().__init__(parent)
         self.setWindowTitle("Shaped MBTiles Configuration")
-        self.resize(400, 320)
+        self.resize(400, 400)
         self.poly = polygon_geometry
         self.web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
         self.source_crs = QgsProject.instance().crs()
+        self.background_color = None  # Optional background color
         
         layout = QFormLayout(self)
         
-        
+        # Zoom levels
         self.min_zoom = QSpinBox()
         self.min_zoom.setRange(0, 22)
         self.min_zoom.setValue(10)
-        self.min_zoom.valueChanged.connect(self.update_estimate)
-        layout.addRow("Minimum Zoom:", self.min_zoom)
+        layout.addRow("Minimum zoom:", self.min_zoom)
         
         self.max_zoom = QSpinBox()
         self.max_zoom.setRange(0, 22)
         self.max_zoom.setValue(14)
-        self.max_zoom.valueChanged.connect(self.update_estimate)
-        layout.addRow("Maximum Zoom:", self.max_zoom)
+        layout.addRow("Maximum zoom:", self.max_zoom)
         
-        self.color_select = QComboBox()
-        self.color_select.addItems([
-            "Transparent Outside (PNG)", 
-            "White Outside (JPG/PNG)", 
-            "Black Outside (JPG/PNG)"
-        ])
-        layout.addRow("Mask Style:", self.color_select)
-
+        # DPI
+        self.dpi = QSpinBox()
+        self.dpi.setRange(48, 384)
+        self.dpi.setValue(96)
+        layout.addRow("DPI:", self.dpi)
+        
+        # Background color (optional)
+        self.bg_color_btn = QPushButton("Select Color (Optional)")
+        self.bg_color_btn.clicked.connect(self.select_background_color)
+        self.bg_color_label = QLabel("No background color")
+        layout.addRow("Background color [optional]:", self.bg_color_btn)
+        layout.addRow("", self.bg_color_label)
+        
+        # Enable antialiasing
+        self.antialias_check = QCheckBox("Enable antialiasing")
+        self.antialias_check.setChecked(True)
+        layout.addRow(self.antialias_check)
+        
+        # Tile format
+        self.tile_format = QComboBox()
+        self.tile_format.addItems(["PNG", "JPG"])
+        self.tile_format.currentIndexChanged.connect(self.update_format_options)
+        layout.addRow("Tile format:", self.tile_format)
+        
+        # Quality (JPG only)
+        self.jpeg_quality = QSpinBox()
+        self.jpeg_quality.setRange(1, 100)
+        self.jpeg_quality.setValue(75)
+        self.jpeg_quality_label = QLabel("Quality (JPG only):")
+        layout.addRow(self.jpeg_quality_label, self.jpeg_quality)
+        
+        # Metatile size
+        self.metatile_size = QSpinBox()
+        self.metatile_size.setRange(1, 20)
+        self.metatile_size.setValue(4)
+        layout.addRow("Metatile size:", self.metatile_size)
+        
+        # Output file
         self.file_btn = QPushButton("Select Output File...")
         self.file_btn.clicked.connect(self.select_file)
         self.output_path = ""
         self.file_label = QLabel("No file selected")
         self.file_label.setWordWrap(True)
-        layout.addRow(self.file_btn, self.file_label)
-        
-        self.estimate_label = QLabel("Calculating...")
-        self.estimate_label.setStyleSheet("font-weight: bold;")
-        layout.addRow("Tiles to Generate:", self.estimate_label)
+        layout.addRow("Output:", self.file_btn)
+        layout.addRow("", self.file_label)
         
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.accept)
+        self.buttons.accepted.connect(self.validate_and_accept)
         self.buttons.rejected.connect(self.reject)
         layout.addRow(self.buttons)
         
-        self.update_estimate()
+        self.update_format_options()
+    
+    def validate_and_accept(self):
+        """Validate inputs before accepting"""
+        min_z = self.min_zoom.value()
+        max_z = self.max_zoom.value()
+        
+        if min_z > max_z:
+            QMessageBox.warning(
+                self, 
+                "Invalid Zoom Levels", 
+                f"Minimum zoom ({min_z}) cannot be greater than maximum zoom ({max_z}).\n\nPlease adjust the zoom levels."
+            )
+            return
+        
+        # If validation passes, accept the dialog
+        self.accept()
 
     def select_file(self):
         f, _ = QFileDialog.getSaveFileName(self, "Save MBTiles", "", "MBTiles (*.mbtiles)")
@@ -333,30 +617,24 @@ class ShapedTileConfigDialog(QDialog):
                 f += '.mbtiles'
             self.output_path = f
             self.file_label.setText(os.path.basename(f))
-
-    def update_estimate(self):
-        min_z = self.min_zoom.value()
-        max_z = self.max_zoom.value()
-        
-        if min_z > max_z:
-            self.estimate_label.setText("Error: Min > Max")
-            self.estimate_label.setStyleSheet("color: red;")
-            return
-
-        tiles, _ = get_intersecting_tiles(self.poly, self.source_crs, min_z, max_z)
-        actual_tiles = len(tiles)
-        
-        if actual_tiles < 50000:
-            self.estimate_label.setStyleSheet("color: green; font-weight: bold;")
-        elif actual_tiles < 500000:
-            self.estimate_label.setStyleSheet("color: orange; font-weight: bold;")
+    
+    def select_background_color(self):
+        """Select optional background color"""
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.background_color = color
+            self.bg_color_label.setText(f"RGB({color.red()}, {color.green()}, {color.blue()})")
+            self.bg_color_label.setStyleSheet(f"background-color: {color.name()}; padding: 5px;")
         else:
-            self.estimate_label.setStyleSheet("color: red; font-weight: bold;")
-        
-        self.estimate_label.setText(f"{actual_tiles:,} tiles")
-        
-        self.tile_count_cache = actual_tiles
-        self.tiles_cache = tiles
+            self.background_color = None
+            self.bg_color_label.setText("No background color")
+            self.bg_color_label.setStyleSheet("")
+    
+    def update_format_options(self):
+        """Show/hide format-specific options"""
+        is_jpg = self.tile_format.currentText() == "JPG"
+        self.jpeg_quality.setVisible(is_jpg)
+        self.jpeg_quality_label.setVisible(is_jpg)
 
     def get_settings(self):
         tiles, poly_3857 = get_intersecting_tiles(
@@ -366,7 +644,12 @@ class ShapedTileConfigDialog(QDialog):
         return {
             'ZOOM_MIN': self.min_zoom.value(),
             'ZOOM_MAX': self.max_zoom.value(),
-            'MASK_STYLE': self.color_select.currentIndex(),
+            'DPI': self.dpi.value(),
+            'BACKGROUND_COLOR': self.background_color,
+            'ANTIALIAS': self.antialias_check.isChecked(),
+            'TILE_FORMAT': self.tile_format.currentText().lower(),
+            'JPEG_QUALITY': self.jpeg_quality.value(),
+            'METATILE_SIZE': self.metatile_size.value(),
             'OUTPUT_FILE': self.output_path,
             'TILES': tiles,
             'POLYGON_3857': poly_3857
@@ -376,14 +659,40 @@ class ShapedTileConfigDialog(QDialog):
 # 5. DRAW TOOL
 # ======================================================
 class ShapedMBTilesTool(QgsMapTool):
+    """
+    Interactive map tool for drawing polygons and generating shaped MBTiles.
+    
+    Features:
+    - Left-click to add polygon vertices
+    - Middle-click or Delete/Backspace to undo last point
+    - Right-click to finish and open export dialog
+    - ESC to cancel and exit
+    - Pause/resume functionality (preserves state in global _drawing_state)
+    - Visual feedback via QgsRubberBand
+    
+    State management:
+    Uses global _drawing_state dict to persist points across pause/resume cycles.
+    When pausing, tool deactivates but state remains. When resuming, new instance
+    reads saved state.
+    """
+    
     def __init__(self, canvas, resume_points=None):
+        """
+        Initialize drawing tool.
+        
+        Args:
+            canvas: QgsMapCanvas to draw on
+            resume_points: List of QgsPointXY to resume from (for pause/resume)
+        """
         self.canvas = canvas
         QgsMapTool.__init__(self, self.canvas)
+        
+        # Setup rubber band for visual feedback
         self.rubberBand = QgsRubberBand(self.canvas, QgsWkbTypes.PolygonGeometry)
         self.rubberBand.setColor(QColor(50, 200, 50, 180))
         self.rubberBand.setWidth(3)
         
-        # If resuming, restore points
+        # Restore points if resuming
         if resume_points:
             self.points = resume_points
             for pt in self.points:
@@ -391,7 +700,7 @@ class ShapedMBTilesTool(QgsMapTool):
         else:
             self.points = []
         
-        # Store reference globally
+        # Update global state
         _drawing_state['tool'] = self
         _drawing_state['rubber_band'] = self.rubberBand
         _drawing_state['paused'] = False
@@ -404,9 +713,46 @@ class ShapedMBTilesTool(QgsMapTool):
             # Keep global state in sync
             _drawing_state['points'] = self.points
         elif e.button() == Qt.RightButton:
-            if len(self.points) > 2:
+            # Shift+Right-click = undo, regular right-click = finish
+            if e.modifiers() & Qt.ShiftModifier:
+                self._undo_last_point()
+            elif len(self.points) > 2:
                 self.finish_drawing()
+            else:
+                self.reset()
+        elif e.button() == Qt.MiddleButton:
+            # Undo last point
+            self._undo_last_point()
+    
+    def keyPressEvent(self, e):
+        """Handle keyboard shortcuts for undo and exit"""
+        if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self._undo_last_point()
+        elif e.key() == Qt.Key_Escape:
+            # ESC key to cancel drawing and exit
+            iface.messageBar().pushMessage(
+                "Drawing Cancelled", 
+                "Exited drawing mode",
+                level=0, duration=2
+            )
             self.reset()
+        else:
+            QgsMapTool.keyPressEvent(self, e)
+    
+    def _undo_last_point(self):
+        """Remove the last point from the polygon"""
+        if self.points:
+            self.points.pop()
+            # Rebuild rubber band
+            self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
+            for pt in self.points:
+                self.rubberBand.addPoint(pt)
+            _drawing_state['points'] = self.points
+            iface.messageBar().pushMessage(
+                "Point Removed", 
+                f"{len(self.points)} points remaining",
+                level=0, duration=1
+            )
 
     def reset(self):
         self.points = []
@@ -417,9 +763,18 @@ class ShapedMBTilesTool(QgsMapTool):
         _drawing_state['paused'] = False
         _drawing_state['tool'] = None
         _drawing_state['rubber_band'] = None
+        # Update pause button text
+        if _pause_action:
+            _pause_action.setText("Pause Drawing")
 
     def pause(self):
-        """Pause drawing - keep points but release the tool"""
+        """
+        Pause drawing and release the tool.
+        
+        Saves current points to global state, sets intentional_pause flag to
+        prevent cleanup in deactivate(), and unsets the tool. Rubber band
+        remains visible so user can see their work.
+        """
         _drawing_state['points'] = self.points.copy()
         _drawing_state['paused'] = True
         _drawing_state['intentional_pause'] = True  # Flag to prevent deactivate cleanup
@@ -432,7 +787,16 @@ class ShapedMBTilesTool(QgsMapTool):
         )
 
     def deactivate(self):
-        """Called when tool is deactivated (user switches to another tool)"""
+        """
+        Called when tool is deactivated (user switches to another tool).
+        
+        Cleanup behavior:
+        - If intentional_pause=True: Keep state, rubber band stays visible
+        - If intentional_pause=False: User switched away, clean everything up
+        
+        This ensures switching tools (without pause) removes the polygon, but
+        explicit pause preserves it.
+        """
         # If this wasn't an intentional pause, clean up everything
         if not _drawing_state.get('intentional_pause', False):
             self.rubberBand.reset(QgsWkbTypes.PolygonGeometry)
@@ -452,21 +816,53 @@ class ShapedMBTilesTool(QgsMapTool):
         
         dlg = ShapedTileConfigDialog(poly_geom, iface.mainWindow())
         if dlg.exec_() != QDialog.Accepted:
+            # User cancelled - ensure tool stays active and polygon remains visible
+            # Reactivate the tool in case dialog deactivated it
+            iface.mapCanvas().setMapTool(self)
             return
         
         settings = dlg.get_settings()
         
         if not settings['OUTPUT_FILE']:
             QMessageBox.warning(None, "Error", "Please select an output file.")
+            # User didn't select file - ensure tool stays active and continue drawing
+            iface.mapCanvas().setMapTool(self)
             return
         
+        # Only proceed with generation if everything is set
         self.generate_tiles(settings)
 
     def generate_tiles(self, settings):
+        """
+        Generate MBTiles from the drawn polygon and current map layers.
+        
+        Process:
+        1. Initialize MBTilesWriter and ShapedTileRenderer
+        2. For each intersecting tile:
+           - Render tile with polygon clipping
+           - Encode as PNG or JPEG
+           - Write to database
+           - Batch commit every 100 tiles
+        3. Close database (commits and runs VACUUM)
+        4. Clear polygon and exit drawing mode
+        
+        Shows progress dialog with time estimates. Can be cancelled by user.
+        
+        Args:
+            settings: Dict from ShapedTileConfigDialog.get_settings() containing
+                      all configuration options and pre-calculated tile list
+        """
         tiles = settings['TILES']
         polygon = settings['POLYGON_3857']
         output_path = settings['OUTPUT_FILE']
-        mask_style = settings['MASK_STYLE']
+        tile_format = settings['TILE_FORMAT']
+        jpeg_quality = settings.get('JPEG_QUALITY', 75)
+        dpi = settings.get('DPI', 96)
+        background_color = settings.get('BACKGROUND_COLOR')
+        antialias = settings.get('ANTIALIAS', True)
+        metatile_size = settings.get('METATILE_SIZE', 4)
+        
+        BATCH_SIZE = 100  # Commit every N tiles for better performance
         
         progress = QProgressDialog("Generating MBTiles...", "Cancel", 0, len(tiles), iface.mainWindow())
         progress.setWindowModality(Qt.WindowModal)
@@ -474,7 +870,6 @@ class ShapedMBTilesTool(QgsMapTool):
         progress.setValue(0)
         
         layers = [l for l in iface.mapCanvas().layers() if l.isValid()]
-        tile_format = "png" if mask_style == 0 else "jpg"
         
         wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
         web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
@@ -493,7 +888,15 @@ class ShapedMBTilesTool(QgsMapTool):
             max_zoom=settings['ZOOM_MAX']
         )
         
-        renderer = ShapedTileRenderer(polygon, mask_style)
+        renderer = ShapedTileRenderer(
+            polygon, 
+            tile_format=tile_format,
+            background_color=background_color,
+            dpi=dpi,
+            antialias=antialias,
+            metatile_size=metatile_size
+        )
+        start_time = time.time()
         
         try:
             for i, (z, x, y) in enumerate(tiles):
@@ -505,15 +908,33 @@ class ShapedMBTilesTool(QgsMapTool):
                 buffer = QBuffer()
                 buffer.open(QIODevice.WriteOnly)
                 
-                if mask_style == 0:
+                if tile_format == 'png':
                     image.save(buffer, "PNG")
                 else:
-                    image.save(buffer, "JPEG", 85)
+                    image.save(buffer, "JPEG", jpeg_quality)
                 
                 writer.write_tile(z, x, y, bytes(buffer.data()))
                 
+                # Batch commit for better performance
+                if (i + 1) % BATCH_SIZE == 0:
+                    writer.commit()
+                
+                # Calculate time remaining
+                elapsed = time.time() - start_time
+                if i > 0:
+                    per_tile = elapsed / (i + 1)
+                    remaining_secs = per_tile * (len(tiles) - i - 1)
+                    if remaining_secs < 60:
+                        eta_str = f" (~{int(remaining_secs)}s left)"
+                    elif remaining_secs < 3600:
+                        eta_str = f" (~{int(remaining_secs/60)}m left)"
+                    else:
+                        eta_str = f" (~{remaining_secs/3600:.1f}h left)"
+                else:
+                    eta_str = ""
+                
                 progress.setValue(i + 1)
-                progress.setLabelText(f"Tile {i+1}/{len(tiles)} (Z{z})")
+                progress.setLabelText(f"Tile {i+1}/{len(tiles)} (Z{z}){eta_str}")
                 QApplication.processEvents()
             
             writer.close()
@@ -524,8 +945,11 @@ class ShapedMBTilesTool(QgsMapTool):
                     f"Generated {len(tiles)} tiles to {os.path.basename(output_path)}", 
                     level=3, duration=5
                 )
+                # Clear polygon and exit drawing mode after successful generation
+                self.reset()
         except Exception as e:
             QMessageBox.critical(None, "Error", f"Generation failed: {str(e)}")
+            # On error, keep the polygon visible so user can try again
         finally:
             progress.close()
 
@@ -537,7 +961,13 @@ class ShapedMBTilesTool(QgsMapTool):
 _pause_action = None
 
 def update_pause_button_text():
-    """Update the pause/resume button text based on current state"""
+    """
+    Update the pause/resume button text based on current drawing state.
+    
+    Button text states:
+    - "Resume Drawing" when paused with points saved
+    - "Pause Drawing" when actively drawing or idle
+    """
     global _pause_action
     if _pause_action:
         if _drawing_state['paused']:
@@ -548,7 +978,12 @@ def update_pause_button_text():
             _pause_action.setText("Pause Drawing")
 
 def activate_shaped_tool():
-    """Start a new drawing"""
+    """
+    Start a new drawing session.
+    
+    If there's an existing paused drawing, it's cleared first to ensure
+    a clean slate. Activates ShapedMBTilesTool and updates button text.
+    """
     # If there's an existing paused drawing, clear it first
     if _drawing_state['paused'] and _drawing_state['rubber_band']:
         _drawing_state['rubber_band'].reset(QgsWkbTypes.PolygonGeometry)
@@ -560,7 +995,14 @@ def activate_shaped_tool():
     update_pause_button_text()
 
 def toggle_pause_resume():
-    """Toggle between pause and resume drawing"""
+    """
+    Toggle between paused and active drawing states.
+    
+    Behavior:
+    - If paused with saved points: Resume drawing with those points
+    - If actively drawing: Pause and save points
+    - If no drawing: Show message to start drawing first
+    """
     if _drawing_state['paused'] and _drawing_state['points']:
         # Currently paused - RESUME
         if _drawing_state['rubber_band']:
@@ -596,15 +1038,20 @@ for action_text in ["Draw Shaped MBTiles", "Pause/Cancel Drawing", "Pause Drawin
 
 # Add Draw button (starts new drawing)
 draw_action = QAction("Draw Shaped MBTiles", main_window)
+draw_action.setShortcut("Ctrl+Shift+M")
 draw_action.triggered.connect(activate_shaped_tool)
 iface.addToolBarIcon(draw_action)
 
 # Add Pause/Resume toggle button
 _pause_action = QAction("Pause Drawing", main_window)
+_pause_action.setShortcut("Ctrl+Shift+P")
 _pause_action.triggered.connect(toggle_pause_resume)
 iface.addToolBarIcon(_pause_action)
 
 print("Shaped MBTiles Tool loaded!")
-print("- Click 'Draw Shaped MBTiles' to start a new drawing")
-print("- Click 'Pause Drawing' to pause, then same button to resume")
-print("- Left-click to add points, right-click to finish")
+print("- Click 'Draw Shaped MBTiles' (Ctrl+Shift+M) to start a new drawing")
+print("- Click 'Pause Drawing' (Ctrl+Shift+P) to pause/resume")
+print("- Left-click to add points")
+print("- Delete/Backspace key OR Shift+Right-click OR middle-click to undo last point")
+print("- Right-click to finish drawing")
+print("- ESC key to cancel and exit drawing mode")
