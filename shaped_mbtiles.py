@@ -12,16 +12,19 @@ Key features:
 - Meta-tiling to prevent label clipping at tile edges
 - Pause/resume drawing functionality
 - Standard QGIS MBTiles options (DPI, format, quality, etc.)
-- Progress tracking with time estimates
+- Incremental tile generation using QTimer (non-blocking UI with progress dialog)
+- Pre-flight tile count estimates
+- Memory safety limits for metatile size
 - Batch database commits for performance
 
 Architecture:
 1. Tile math utilities - coordinate conversions and spatial filtering
 2. MBTilesWriter - SQLite database with MBTiles schema
 3. ShapedTileRenderer - renders tiles with polygon clipping
-4. ShapedTileConfigDialog - configuration UI
-5. ShapedMBTilesTool - interactive drawing tool
-6. Launch code - toolbar buttons and keyboard shortcuts
+4. IncrementalTileGenerator - QTimer-based non-blocking generation with progress
+5. ShapedTileConfigDialog - configuration UI with estimates
+6. ShapedMBTilesTool - interactive drawing tool
+7. Launch code - toolbar buttons and keyboard shortcuts
 
 See shaped_mbtiles.md for detailed technical documentation.
 See README.md for user documentation.
@@ -38,12 +41,13 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsGeometry,
                        QgsCoordinateReferenceSystem, QgsRectangle)
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.utils import iface
-from PyQt5.QtCore import Qt, QSize, QBuffer, QIODevice, QByteArray
+from PyQt5.QtCore import Qt, QSize, QBuffer, QIODevice, QByteArray, pyqtSignal, QObject, QTimer
 from PyQt5.QtGui import QColor, QImage, QPainter, QPainterPath, QKeyEvent
 from PyQt5.QtWidgets import (QAction, QDialog, QSpinBox, QPushButton, 
                              QFileDialog, QFormLayout, QDialogButtonBox, 
                              QLabel, QProgressDialog, QComboBox, QMessageBox,
-                             QApplication, QCheckBox, QColorDialog)
+                             QApplication, QCheckBox, QColorDialog, QGroupBox,
+                             QVBoxLayout, QHBoxLayout)
 
 # ======================================================
 # CONSTANTS
@@ -52,6 +56,11 @@ TILE_SIZE = 256  # Standard web map tile size (TMS specification)
 ORIGIN_SHIFT = 20037508.342789244  # Web Mercator (EPSG:3857) extent in meters
 WORLD_CIRCUMFERENCE = 40075016.686  # Earth's circumference at equator in meters
 
+# Memory safety limits
+MAX_RENDER_PIXELS = 4096  # Maximum render canvas size in pixels (prevents OOM)
+MAX_METATILE_SIZE = 16    # Capped metatile size (16 * 256 = 4096 pixels)
+MEMORY_WARNING_MB = 200   # Warn if estimated memory usage exceeds this
+
 # Global state to persist drawing between pause/resume cycles
 # This dict allows the drawing tool to be deactivated (for pan/zoom) while
 # preserving the polygon points and rubber band. When resuming, a new tool
@@ -59,8 +68,8 @@ WORLD_CIRCUMFERENCE = 40075016.686  # Earth's circumference at equator in meters
 _drawing_state = {
     'points': [],              # List of QgsPointXY vertices
     'paused': False,           # True when drawing is paused
-    'tool': None,             # Reference to active ShapedMBTilesTool instance
-    'rubber_band': None,      # Reference to QgsRubberBand for visual feedback
+    'tool': None,              # Reference to active ShapedMBTilesTool instance
+    'rubber_band': None,       # Reference to QgsRubberBand for visual feedback
     'intentional_pause': False # Flag to distinguish pause from accidental tool switch
 }
 
@@ -183,6 +192,62 @@ def get_intersecting_tiles(polygon_geom, source_crs, zoom_min, zoom_max):
     
     return tiles, poly_3857
 
+def estimate_tile_count_fast(polygon_geom, source_crs, zoom_min, zoom_max):
+    """
+    Quick estimate of tile count using bounding box only (no intersection test).
+    
+    This is much faster than get_intersecting_tiles() and useful for UI feedback.
+    The actual count will be lower for irregular polygons.
+    
+    Args:
+        polygon_geom: QgsGeometry polygon
+        source_crs: Source CRS of polygon
+        zoom_min, zoom_max: Zoom level range
+    
+    Returns:
+        Tuple of (estimated_count, is_exact). is_exact=False for estimates.
+    """
+    web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
+    transform = QgsCoordinateTransform(source_crs, web_mercator, QgsProject.instance())
+    
+    poly_3857 = QgsGeometry(polygon_geom)
+    poly_3857.transform(transform)
+    bbox = poly_3857.boundingBox()
+    
+    total = 0
+    for z in range(zoom_min, zoom_max + 1):
+        x_min, y_min = meters_to_tile(bbox.xMinimum(), bbox.yMaximum(), z)
+        x_max, y_max = meters_to_tile(bbox.xMaximum(), bbox.yMinimum(), z)
+        
+        max_tile = (2 ** z) - 1
+        x_min = max(0, x_min)
+        x_max = min(max_tile, x_max)
+        y_min = max(0, y_min)
+        y_max = min(max_tile, y_max)
+        
+        cols = x_max - x_min + 1
+        rows = y_max - y_min + 1
+        total += cols * rows
+    
+    return total, False  # is_exact=False because this is bbox estimate
+
+def estimate_memory_usage(metatile_size, dpi):
+    """
+    Estimate memory usage per tile render in MB.
+    
+    Args:
+        metatile_size: Metatile multiplier
+        dpi: DPI setting
+    
+    Returns:
+        Estimated MB per tile
+    """
+    # Render size in pixels (capped at MAX_RENDER_PIXELS)
+    render_size = min(TILE_SIZE * metatile_size, MAX_RENDER_PIXELS)
+    # 4 bytes per pixel (RGBA), plus some overhead
+    bytes_per_tile = render_size * render_size * 4 * 1.5  # 1.5x for overhead
+    return bytes_per_tile / (1024 * 1024)
+
 # ======================================================
 # 2. MBTILES DATABASE HANDLER
 # ======================================================
@@ -195,7 +260,6 @@ class MBTilesWriter:
     - Metadata writing (name, bounds, format, zoom levels, etc.)
     - Tile writing with XYZ to TMS coordinate conversion
     - Batch commits for performance
-    - Database cleanup (VACUUM on close)
     
     MBTiles spec: https://github.com/mapbox/mbtiles-spec
     """
@@ -284,8 +348,8 @@ class MBTilesWriter:
         self.conn.commit()
     
     def close(self):
+        """Close the database connection."""
         self.conn.commit()
-        self.cursor.execute("VACUUM")
         self.conn.close()
 
 # ======================================================
@@ -305,15 +369,17 @@ class ShapedTileRenderer:
     - Skips clipping for tiles fully inside polygon (containment test)
     - Uses meta-tiling to prevent label clipping at tile edges
     - Configurable DPI and antialiasing for quality/speed trade-offs
+    - Reuses QgsMapSettings across all tiles (only extent/size change per tile)
     """
     
-    def __init__(self, polygon_geom_3857, tile_format='png', background_color=None, 
+    def __init__(self, polygon_geom_3857, layers, tile_format='png', background_color=None, 
                  dpi=96, antialias=True, metatile_size=4):
         """
         Initialize renderer.
         
         Args:
             polygon_geom_3857: QgsGeometry polygon in Web Mercator (EPSG:3857)
+            layers: List of QgsMapLayers to render (set once for all tiles)
             tile_format: "png" or "jpg"
             background_color: QColor for background (None = transparent for PNG, white for JPG)
             dpi: Dots per inch for rendering (48-384)
@@ -328,7 +394,16 @@ class ShapedTileRenderer:
         self.metatile_size = metatile_size
         self.web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
         
-    def render_tile(self, z, x, y, layers):
+        # Pre-configure map settings (reused across all tiles)
+        # Only extent and output size change per tile
+        self.map_settings = QgsMapSettings()
+        self.map_settings.setDestinationCrs(self.web_mercator)
+        self.map_settings.setOutputDpi(dpi)
+        self.map_settings.setLayers(layers)
+        self.map_settings.setFlag(QgsMapSettings.Antialiasing, antialias)
+        self.map_settings.setFlag(QgsMapSettings.UseAdvancedEffects, antialias)
+        
+    def render_tile(self, z, x, y):
         """
         Render a single tile with polygon clipping.
         
@@ -342,7 +417,6 @@ class ShapedTileRenderer:
         
         Args:
             z, x, y: XYZ tile coordinates
-            layers: List of QgsMapLayers to render
         
         Returns:
             QImage of size 256×256 pixels
@@ -367,15 +441,9 @@ class ShapedTileRenderer:
             extent.yMaximum() + expand_y
         )
         
-        # Setup map settings
-        settings = QgsMapSettings()
-        settings.setOutputSize(QSize(render_size, render_size))
-        settings.setOutputDpi(self.dpi)
-        settings.setExtent(render_extent)
-        settings.setDestinationCrs(self.web_mercator)
-        settings.setLayers(layers)
-        settings.setFlag(QgsMapSettings.Antialiasing, self.antialias)
-        settings.setFlag(QgsMapSettings.UseAdvancedEffects, self.antialias)
+        # Update only the per-tile settings (extent and size)
+        self.map_settings.setOutputSize(QSize(render_size, render_size))
+        self.map_settings.setExtent(render_extent)
         
         # Determine background color
         if self.background_color:
@@ -407,7 +475,7 @@ class ShapedTileRenderer:
                 painter.setClipPath(clip_path)
         
         # Render map - with clipping, only pixels inside the path are drawn
-        job = QgsMapRendererCustomPainterJob(settings, painter)
+        job = QgsMapRendererCustomPainterJob(self.map_settings, painter)
         job.start()
         job.waitForFinished()
         
@@ -493,7 +561,196 @@ class ShapedTileRenderer:
         return path
 
 # ======================================================
-# 4. CONFIGURATION DIALOG
+# 4. INCREMENTAL TILE GENERATOR
+# ======================================================
+class IncrementalTileGenerator(QObject):
+    """
+    Generates tiles incrementally using QTimer to keep UI responsive.
+    
+    Unlike QgsTask (which runs in a background thread), this runs on the
+    main thread but yields control back to Qt's event loop between tiles.
+    This is necessary because QPainter and QgsMapRendererCustomPainterJob
+    require main thread execution.
+    
+    Benefits over blocking loop with processEvents():
+    - Proper event loop integration (no re-entrancy bugs)
+    - Clean cancellation via dialog
+    - Progress updates without blocking
+    """
+    
+    finished = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self, settings, layers, on_complete_callback):
+        super().__init__()
+        self.settings = settings
+        self.layers = layers
+        self.on_complete_callback = on_complete_callback
+        
+        self.tiles = settings['TILES']
+        self.current_index = 0
+        self.tiles_generated = 0
+        self.start_time = None
+        self.cancelled = False
+        self.finished = False  # Prevents double-finish from dialog close signal
+        
+        # Initialize components
+        self._init_writer()
+        self._init_renderer()
+        self._init_progress_dialog()
+        
+        # Timer for incremental processing
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._process_next_tile)
+    
+    def _init_writer(self):
+        """Initialize MBTiles database writer."""
+        polygon = self.settings['POLYGON_3857']
+        output_path = self.settings['OUTPUT_FILE']
+        tile_format = self.settings['TILE_FORMAT']
+        
+        # Calculate bounds in WGS84
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
+        to_wgs84 = QgsCoordinateTransform(web_mercator, wgs84, QgsProject.instance())
+        bbox_wgs84 = to_wgs84.transformBoundingBox(polygon.boundingBox())
+        bounds = (bbox_wgs84.xMinimum(), bbox_wgs84.yMinimum(), 
+                  bbox_wgs84.xMaximum(), bbox_wgs84.yMaximum())
+        
+        self.writer = MBTilesWriter(
+            output_path,
+            name="Shaped Export",
+            description="Generated by QGIS",
+            tile_format=tile_format,
+            bounds=bounds,
+            min_zoom=self.settings['ZOOM_MIN'],
+            max_zoom=self.settings['ZOOM_MAX']
+        )
+    
+    def _init_renderer(self):
+        """Initialize tile renderer with pre-configured map settings."""
+        polygon = self.settings['POLYGON_3857']
+        metatile_size = min(self.settings.get('METATILE_SIZE', 4), MAX_METATILE_SIZE)
+        
+        # Pass layers to renderer - they're set once and reused for all tiles
+        self.renderer = ShapedTileRenderer(
+            polygon,
+            self.layers,  # Layers set once for all tiles (optimization)
+            tile_format=self.settings['TILE_FORMAT'],
+            background_color=self.settings.get('BACKGROUND_COLOR'),
+            dpi=self.settings.get('DPI', 96),
+            antialias=self.settings.get('ANTIALIAS', True),
+            metatile_size=metatile_size
+        )
+        self.tile_format = self.settings['TILE_FORMAT']
+        self.jpeg_quality = self.settings.get('JPEG_QUALITY', 75)
+    
+    def _init_progress_dialog(self):
+        """Initialize progress dialog."""
+        self.progress = QProgressDialog(
+            "Generating MBTiles...", 
+            "Cancel", 
+            0, 
+            len(self.tiles), 
+            iface.mainWindow()
+        )
+        self.progress.setWindowModality(Qt.WindowModal)
+        self.progress.setMinimumDuration(0)
+        self.progress.setValue(0)
+        self.progress.canceled.connect(self._on_cancel)
+    
+    def start(self):
+        """Start tile generation."""
+        self.start_time = time.time()
+        self.timer.start(0)  # Process as fast as possible, yielding to event loop
+    
+    def _on_cancel(self):
+        """Handle cancel button click."""
+        # Only process cancel if we haven't already finished
+        # (QProgressDialog emits canceled when closed, even after completion)
+        if not self.finished and not self.cancelled:
+            self.cancelled = True
+            self.timer.stop()
+            self._finish(False, "Generation cancelled by user")
+    
+    def _process_next_tile(self):
+        """Process the next tile in the queue."""
+        if self.cancelled:
+            return
+        
+        if self.current_index >= len(self.tiles):
+            # All tiles processed
+            self.timer.stop()
+            self._finish(True, f"Generated {self.tiles_generated} tiles")
+            return
+        
+        try:
+            z, x, y = self.tiles[self.current_index]
+            
+            # Render tile (layers already set in renderer)
+            image = self.renderer.render_tile(z, x, y)
+            
+            # Encode image
+            buffer = QBuffer()
+            buffer.open(QIODevice.WriteOnly)
+            if self.tile_format == 'png':
+                image.save(buffer, "PNG")
+            else:
+                image.save(buffer, "JPEG", self.jpeg_quality)
+            
+            self.writer.write_tile(z, x, y, bytes(buffer.data()))
+            
+            # Batch commit every 100 tiles
+            if (self.current_index + 1) % 100 == 0:
+                self.writer.commit()
+            
+            self.current_index += 1
+            self.tiles_generated += 1
+            
+            # Update progress
+            self._update_progress(z)
+            
+        except Exception as e:
+            self.timer.stop()
+            self._finish(False, f"Error at tile {self.current_index}: {str(e)}")
+    
+    def _update_progress(self, current_zoom):
+        """Update progress dialog with ETA."""
+        elapsed = time.time() - self.start_time
+        remaining_tiles = len(self.tiles) - self.current_index
+        
+        if self.current_index > 0:
+            per_tile = elapsed / self.current_index
+            remaining_secs = per_tile * remaining_tiles
+            
+            if remaining_secs < 60:
+                eta_str = f" (~{int(remaining_secs)}s left)"
+            elif remaining_secs < 3600:
+                eta_str = f" (~{int(remaining_secs/60)}m left)"
+            else:
+                eta_str = f" (~{remaining_secs/3600:.1f}h left)"
+        else:
+            eta_str = ""
+        
+        self.progress.setValue(self.current_index)
+        self.progress.setLabelText(f"Tile {self.current_index}/{len(self.tiles)} (Z{current_zoom}){eta_str}")
+    
+    def _finish(self, success, message):
+        """Clean up and call completion callback."""
+        # Prevent double-finish
+        if self.finished:
+            return
+        self.finished = True
+        
+        try:
+            self.writer.close()
+        except:
+            pass
+        
+        self.progress.close()
+        self.on_complete_callback(success, message)
+
+# ======================================================
+# 5. CONFIGURATION DIALOG  
 # ======================================================
 class ShapedTileConfigDialog(QDialog):
     """
@@ -508,6 +765,8 @@ class ShapedTileConfigDialog(QDialog):
     - JPEG quality (when using JPG)
     - Metatile size for edge buffering
     - Output file selection
+    - Tile count estimate (pre-flight check)
+    - Memory usage warning
     
     Validates inputs (min <= max zoom) before accepting.
     """
@@ -522,11 +781,14 @@ class ShapedTileConfigDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("Shaped MBTiles Configuration")
-        self.resize(400, 400)
+        self.resize(420, 520)
         self.poly = polygon_geometry
         self.web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
         self.source_crs = QgsProject.instance().crs()
         self.background_color = None  # Optional background color
+        self._update_timer = QTimer()
+        self._update_timer.setSingleShot(True)
+        self._update_timer.timeout.connect(self._do_update_estimate)
         
         layout = QFormLayout(self)
         
@@ -534,17 +796,25 @@ class ShapedTileConfigDialog(QDialog):
         self.min_zoom = QSpinBox()
         self.min_zoom.setRange(0, 22)
         self.min_zoom.setValue(10)
+        self.min_zoom.valueChanged.connect(self.schedule_update_estimate)
         layout.addRow("Minimum zoom:", self.min_zoom)
         
         self.max_zoom = QSpinBox()
         self.max_zoom.setRange(0, 22)
         self.max_zoom.setValue(14)
+        self.max_zoom.valueChanged.connect(self.schedule_update_estimate)
         layout.addRow("Maximum zoom:", self.max_zoom)
+        
+        # Tile estimate (pre-flight check)
+        self.estimate_label = QLabel("Calculating...")
+        self.estimate_label.setStyleSheet("font-weight: bold; padding: 5px; background: #f0f0f0; border-radius: 3px;")
+        layout.addRow("Estimated tiles:", self.estimate_label)
         
         # DPI
         self.dpi = QSpinBox()
         self.dpi.setRange(48, 384)
         self.dpi.setValue(96)
+        self.dpi.valueChanged.connect(self.update_memory_warning)
         layout.addRow("DPI:", self.dpi)
         
         # Background color (optional)
@@ -572,11 +842,17 @@ class ShapedTileConfigDialog(QDialog):
         self.jpeg_quality_label = QLabel("Quality (JPG only):")
         layout.addRow(self.jpeg_quality_label, self.jpeg_quality)
         
-        # Metatile size
+        # Metatile size (capped for memory safety)
         self.metatile_size = QSpinBox()
-        self.metatile_size.setRange(1, 20)
+        self.metatile_size.setRange(1, MAX_METATILE_SIZE)
         self.metatile_size.setValue(4)
+        self.metatile_size.valueChanged.connect(self.update_memory_warning)
         layout.addRow("Metatile size:", self.metatile_size)
+        
+        # Memory warning label
+        self.memory_label = QLabel("")
+        self.memory_label.setWordWrap(True)
+        layout.addRow("", self.memory_label)
         
         # Output file
         self.file_btn = QPushButton("Select Output File...")
@@ -593,6 +869,51 @@ class ShapedTileConfigDialog(QDialog):
         layout.addRow(self.buttons)
         
         self.update_format_options()
+        self.schedule_update_estimate()
+        self.update_memory_warning()
+    
+    def schedule_update_estimate(self):
+        """Debounce tile count updates to prevent freezing while typing."""
+        self._update_timer.start(300)  # 300ms delay
+    
+    def _do_update_estimate(self):
+        """Actually calculate and display tile estimate."""
+        min_z = self.min_zoom.value()
+        max_z = self.max_zoom.value()
+        
+        if min_z > max_z:
+            self.estimate_label.setText("Invalid: min > max")
+            self.estimate_label.setStyleSheet("font-weight: bold; padding: 5px; background: #ffcccc; border-radius: 3px;")
+            return
+
+        # Quick bbox-based estimate (doesn't freeze)
+        count, _ = estimate_tile_count_fast(self.poly, self.source_crs, min_z, max_z)
+        
+        # Color based on count
+        if count < 10000:
+            self.estimate_label.setStyleSheet("font-weight: bold; padding: 5px; background: #ccffcc; border-radius: 3px;")
+            time_est = f" (~{count * 0.1:.0f}s)"
+        elif count < 100000:
+            self.estimate_label.setStyleSheet("font-weight: bold; padding: 5px; background: #ffffcc; border-radius: 3px;")
+            time_est = f" (~{count * 0.1 / 60:.0f}min)"
+        else:
+            self.estimate_label.setStyleSheet("font-weight: bold; padding: 5px; background: #ffcccc; border-radius: 3px;")
+            time_est = f" (~{count * 0.1 / 3600:.1f}h)"
+        
+        self.estimate_label.setText(f"~{count:,} tiles (max){time_est}")
+    
+    def update_memory_warning(self):
+        """Update memory usage warning based on metatile size and DPI."""
+        mem_mb = estimate_memory_usage(self.metatile_size.value(), self.dpi.value())
+        
+        if mem_mb > MEMORY_WARNING_MB:
+            self.memory_label.setText(f"High memory usage: ~{mem_mb:.0f}MB per tile")
+            self.memory_label.setStyleSheet("color: #cc0000;")
+        elif mem_mb > 50:
+            self.memory_label.setText(f"Memory: ~{mem_mb:.0f}MB per tile")
+            self.memory_label.setStyleSheet("color: #666666;")
+        else:
+            self.memory_label.setText("")
     
     def validate_and_accept(self):
         """Validate inputs before accepting"""
@@ -649,14 +970,14 @@ class ShapedTileConfigDialog(QDialog):
             'ANTIALIAS': self.antialias_check.isChecked(),
             'TILE_FORMAT': self.tile_format.currentText().lower(),
             'JPEG_QUALITY': self.jpeg_quality.value(),
-            'METATILE_SIZE': self.metatile_size.value(),
+            'METATILE_SIZE': min(self.metatile_size.value(), MAX_METATILE_SIZE),
             'OUTPUT_FILE': self.output_path,
             'TILES': tiles,
             'POLYGON_3857': poly_3857
         }
 
 # ======================================================
-# 5. DRAW TOOL
+# 6. DRAW TOOL
 # ======================================================
 class ShapedMBTilesTool(QgsMapTool):
     """
@@ -836,125 +1157,44 @@ class ShapedMBTilesTool(QgsMapTool):
         """
         Generate MBTiles from the drawn polygon and current map layers.
         
-        Process:
-        1. Initialize MBTilesWriter and ShapedTileRenderer
-        2. For each intersecting tile:
-           - Render tile with polygon clipping
-           - Encode as PNG or JPEG
-           - Write to database
-           - Batch commit every 100 tiles
-        3. Close database (commits and runs VACUUM)
-        4. Clear polygon and exit drawing mode
-        
-        Shows progress dialog with time estimates. Can be cancelled by user.
+        Uses IncrementalTileGenerator with QTimer for non-blocking generation.
+        Shows a progress dialog with time estimates and cancel button.
         
         Args:
             settings: Dict from ShapedTileConfigDialog.get_settings() containing
                       all configuration options and pre-calculated tile list
         """
         tiles = settings['TILES']
-        polygon = settings['POLYGON_3857']
-        output_path = settings['OUTPUT_FILE']
-        tile_format = settings['TILE_FORMAT']
-        jpeg_quality = settings.get('JPEG_QUALITY', 75)
-        dpi = settings.get('DPI', 96)
-        background_color = settings.get('BACKGROUND_COLOR')
-        antialias = settings.get('ANTIALIAS', True)
-        metatile_size = settings.get('METATILE_SIZE', 4)
         
-        BATCH_SIZE = 100  # Commit every N tiles for better performance
+        if not tiles:
+            QMessageBox.warning(None, "No Tiles", "No tiles intersect the drawn polygon.")
+            return
         
-        progress = QProgressDialog("Generating MBTiles...", "Cancel", 0, len(tiles), iface.mainWindow())
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        
+        # Get current map layers
         layers = [l for l in iface.mapCanvas().layers() if l.isValid()]
         
-        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        web_mercator = QgsCoordinateReferenceSystem("EPSG:3857")
-        to_wgs84 = QgsCoordinateTransform(web_mercator, wgs84, QgsProject.instance())
-        bbox_wgs84 = to_wgs84.transformBoundingBox(polygon.boundingBox())
-        bounds = (bbox_wgs84.xMinimum(), bbox_wgs84.yMinimum(), 
-                  bbox_wgs84.xMaximum(), bbox_wgs84.yMaximum())
+        # Store reference to self for callback
+        tool_ref = self
         
-        writer = MBTilesWriter(
-            output_path,
-            name="Shaped Export",
-            description="Generated by QGIS",
-            tile_format=tile_format,
-            bounds=bounds,
-            min_zoom=settings['ZOOM_MIN'],
-            max_zoom=settings['ZOOM_MAX']
-        )
-        
-        renderer = ShapedTileRenderer(
-            polygon, 
-            tile_format=tile_format,
-            background_color=background_color,
-            dpi=dpi,
-            antialias=antialias,
-            metatile_size=metatile_size
-        )
-        start_time = time.time()
-        
-        try:
-            for i, (z, x, y) in enumerate(tiles):
-                if progress.wasCanceled():
-                    break
-                
-                image = renderer.render_tile(z, x, y, layers)
-                
-                buffer = QBuffer()
-                buffer.open(QIODevice.WriteOnly)
-                
-                if tile_format == 'png':
-                    image.save(buffer, "PNG")
-                else:
-                    image.save(buffer, "JPEG", jpeg_quality)
-                
-                writer.write_tile(z, x, y, bytes(buffer.data()))
-                
-                # Batch commit for better performance
-                if (i + 1) % BATCH_SIZE == 0:
-                    writer.commit()
-                
-                # Calculate time remaining
-                elapsed = time.time() - start_time
-                if i > 0:
-                    per_tile = elapsed / (i + 1)
-                    remaining_secs = per_tile * (len(tiles) - i - 1)
-                    if remaining_secs < 60:
-                        eta_str = f" (~{int(remaining_secs)}s left)"
-                    elif remaining_secs < 3600:
-                        eta_str = f" (~{int(remaining_secs/60)}m left)"
-                    else:
-                        eta_str = f" (~{remaining_secs/3600:.1f}h left)"
-                else:
-                    eta_str = ""
-                
-                progress.setValue(i + 1)
-                progress.setLabelText(f"Tile {i+1}/{len(tiles)} (Z{z}){eta_str}")
-                QApplication.processEvents()
-            
-            writer.close()
-            
-            if not progress.wasCanceled():
+        def on_complete(success, message):
+            """Callback when generation completes."""
+            if success:
                 iface.messageBar().pushMessage(
                     "Success", 
-                    f"Generated {len(tiles)} tiles to {os.path.basename(output_path)}", 
+                    f"{message} to {os.path.basename(settings['OUTPUT_FILE'])}", 
                     level=3, duration=5
                 )
-                # Clear polygon and exit drawing mode after successful generation
-                self.reset()
-        except Exception as e:
-            QMessageBox.critical(None, "Error", f"Generation failed: {str(e)}")
-            # On error, keep the polygon visible so user can try again
-        finally:
-            progress.close()
+                tool_ref.reset()
+            else:
+                iface.messageBar().pushMessage("Generation", message, level=1, duration=5)
+        
+        # Create and start incremental generator
+        # Store reference to prevent garbage collection
+        self._generator = IncrementalTileGenerator(settings, layers, on_complete)
+        self._generator.start()
 
 # ======================================================
-# 6. LAUNCH
+# 7. LAUNCH
 # ======================================================
 
 # Store action reference for updating button text
