@@ -13,7 +13,9 @@ Generate MBTiles from a polygon you draw on the map. Only creates tiles that act
 - **Configurable metatile size** - prevents labels from being cut off at edges
 - **Standard QGIS options** - DPI, antialiasing, tile format (PNG/JPG), background color
 - **JPEG quality control** (1-100%, default 75)
-- **Time remaining estimate** during generation
+- **Non-blocking generation** - progress dialog with time estimates, UI stays responsive
+- **Pre-flight estimates** - see tile count and time estimate before starting
+- **Memory safety** - metatile size capped to prevent crashes
 - **Keyboard shortcuts** for quick access
 - **Batch database commits** for better performance
 
@@ -144,17 +146,18 @@ A toolbar button will appear. Click it to start drawing polygons.
    - Pan/zoom the map as needed
    - Click **"Resume Drawing"** (same button) to continue
 5. **Configure export:**
-   - Set zoom levels (min/max)
+   - Set zoom levels (min/max) - tile count estimate updates automatically
    - Set DPI (48-384, default: 96)
    - Optionally select a background color
    - Enable/disable antialiasing
    - Choose tile format (PNG or JPG)
    - Adjust JPEG quality if using JPG (1-100%, default: 75)
-   - Set metatile size (1-20, default: 4)
+   - Set metatile size (1-16, default: 4) - memory warning shown if too high
    - Select output file location
-6. Click OK and wait for generation to complete
-   - Progress bar shows time remaining estimate
-   - You can cancel at any time
+6. Click OK to start generation
+   - Progress dialog shows current tile and time remaining
+   - Click Cancel to stop generation
+   - UI remains responsive during generation
 
 ## Tips
 
@@ -168,6 +171,7 @@ A toolbar button will appear. Click it to start drawing polygons.
 - Higher DPI (e.g., 192) creates sharper tiles but increases file size
 - Metatile size of 4 is good for preventing label clipping; increase if labels still get cut off
 - Disable antialiasing for faster generation if visual quality isn't critical
+- Check the **tile count estimate** before starting - large numbers mean long wait times
 
 ## Troubleshooting
 
@@ -183,4 +187,3 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
-
