@@ -53,7 +53,7 @@ Meta-tiling renders each tile at a larger size (e.g., 1024×1024 for metatile_si
 - **Metatile size 4 (default):** Good balance for most use cases
 - **Metatile size 8+:** Minimal clipping, suitable for maps with large labels/symbols, 4-8× slower
 
-The metatile size is user-configurable (1-20) to accommodate different map styles and performance requirements.
+The metatile size is user-configurable (1-16, capped for memory safety) to accommodate different map styles and performance requirements.
 
 ### 3. Painter-Based Clipping
 
@@ -143,6 +143,24 @@ The tool calculates all tiles before rendering (rather than discovering them dur
 
 **Trade-off:** For very large zoom ranges, the initial tile calculation can take time. This is acceptable because users need the tile count to decide whether to proceed.
 
+### Incremental Tile Generation
+Tile generation uses `QTimer` for non-blocking operation:
+- Processes one tile at a time, yielding to Qt's event loop between tiles
+- Shows a proper progress dialog with time estimates
+- Allows clean cancellation via Cancel button
+- Prevents re-entrancy bugs from `processEvents()` hacks
+- Rendering stays on main thread (required by Qt/QGIS) but doesn't block UI
+
+**Why not QgsTask?** Qt's `QPainter` and `QgsMapRendererCustomPainterJob` require main thread execution for correct rendering. Using a background thread can cause rendering failures or crashes.
+
+### Pre-Flight Estimates
+The configuration dialog shows:
+- **Tile count estimate:** Quick bounding-box calculation (upper bound, actual may be lower)
+- **Time estimate:** Based on ~0.1s per tile (varies by map complexity)
+- **Memory warning:** Displayed if metatile + DPI combination exceeds safe limits
+
+This helps users decide whether to proceed before committing to potentially long exports.
+
 ## Architecture and Design Decisions
 
 ### Component Separation
@@ -229,10 +247,14 @@ The tool calculates in XYZ internally (matching QGIS conventions) but writes to 
 - Meta-tile: ~1-4MB for 1024×1024 RGBA (metatile_size=4)
 - QGIS render buffers: Variable, depends on layer complexity
 
+**Memory safety limits:**
+- Metatile size is capped at 16 (4096×4096 max render canvas)
+- Dialog shows memory warning if estimated usage exceeds 200MB per tile
+- These limits prevent out-of-memory crashes from extreme settings
+
 **Practical impact:**
 - Normal use: <100MB additional RAM
-- Large metatile (20) + high DPI (300): Can use 500MB+ per tile
-- Multiple threads rendering simultaneously would multiply memory use (not currently implemented)
+- Maximum allowed (metatile 16): ~64MB per tile render
 
 ### Performance Characteristics
 
