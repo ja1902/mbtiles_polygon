@@ -38,87 +38,14 @@ You can find more info on how it works in the shaped_mbtiles.md file.
 
 2. **Create a new folder** called `shaped_mbtiles` inside the plugins folder.
 
-3. **Create these 3 files** inside the `shaped_mbtiles` folder:
+3. **Download the following 4 files from this repository and place them into the shaped_mbtiles folder that you just created:**
+   - __init__.py
+   - metadata.txt
+   - shaped_mbtiles.py
+   - shaped_mbtiles_plugin.py 
 
-**metadata.txt:**
-```ini
-[general]
-name=Shaped MBTiles Generator
-qgisMinimumVersion=3.0
-description=Generate MBTiles from polygon shapes
-version=1.0
-```
+3. **Enable the plugin**: Restart QGIS, then go to **Plugins** → **Manage and Install Plugins** → **Installed** tab. Find "Shaped MBTiles Generator" and check the box to enable it.
 
-**__init__.py:**
-```python
-import os
-
-def classFactory(iface):
-    from .shaped_mbtiles_plugin import ShapedMBTilesPlugin
-    return ShapedMBTilesPlugin(iface)
-```
-
-**shaped_mbtiles_plugin.py:**
-```python
-import os
-from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
-from qgis.utils import iface
-from .shaped_mbtiles import activate_shaped_tool
-
-class ShapedMBTilesPlugin:
-    def __init__(self, iface):
-        self.iface = iface
-        self.plugin_dir = os.path.dirname(__file__)
-
-    def initGui(self):
-        icon_path = os.path.join(self.plugin_dir, "icon.png")
-        icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
-        
-        self.action = QAction(icon, "Draw Shaped MBTiles", self.iface.mainWindow())
-        self.action.triggered.connect(self.run)
-        self.iface.addToolBarIcon(self.action)
-        self.iface.addPluginToMenu("&Shaped MBTiles", self.action)
-
-    def unload(self):
-        self.iface.removePluginMenu("&Shaped MBTiles", self.action)
-        self.iface.removeToolBarIcon(self.action)
-
-    def run(self):
-        activate_shaped_tool()
-```
-
-4. **Copy the main script**: Copy `mbtiles/shaped_mbtiles.py` from this repository into your `shaped_mbtiles` folder.
-
-5. **Edit the script**: Open `shaped_mbtiles.py` in a text editor. Scroll to the very bottom of the file (around line 489-511). You'll see code that looks like this:
-
-```python
-# ======================================================
-# 6. LAUNCH
-# ======================================================
-def activate_shaped_tool():
-    tool = ShapedMBTilesTool(iface.mapCanvas())
-    iface.mapCanvas().setMapTool(tool)
-
-action_name = "Draw Shaped MBTiles (Clipping)"
-main_window = iface.mainWindow()
-... (more code that adds toolbar button)
-```
-
-Delete everything from line 496 onwards (all the code that creates the toolbar button). Keep only the `activate_shaped_tool()` function. The bottom of your file should end with just:
-
-```python
-# ======================================================
-# 6. LAUNCH
-# ======================================================
-def activate_shaped_tool():
-    tool = ShapedMBTilesTool(iface.mapCanvas())
-    iface.mapCanvas().setMapTool(tool)
-```
-
-Why? The plugin wrapper (`shaped_mbtiles_plugin.py`) already handles adding the toolbar button, so you don't need that code in the main script.
-
-6. **Enable the plugin**: Restart QGIS, then go to **Plugins** → **Manage and Install Plugins** → **Installed** tab. Find "Shaped MBTiles Generator" and check the box to enable it.
 
 ### Option 2: Direct Script Loading (No Plugin Setup)
 
@@ -127,8 +54,7 @@ If you don't want to set up a plugin, just load the script directly:
 1. Open QGIS
 2. Go to **Plugins** → **Python Console**
 3. Show editor
-4. Paste the contents of the python file and click run
-
+4. Paste the contents of the shaped_mbtiles_direct.py and click run
 
 A toolbar button will appear. Click it to start drawing polygons.
 
@@ -187,4 +113,5 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
+
 
