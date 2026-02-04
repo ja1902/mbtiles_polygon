@@ -8,8 +8,8 @@ Generate MBTiles from a polygon you draw on the map. Only creates tiles that act
 - **Pause/Resume drawing** - pause to pan/zoom, then resume where you left off
 - **Undo last point** - Delete/Backspace key, Shift+Right-click, or middle-click
 - **ESC to exit** - Press ESC to cancel and exit drawing mode
-- Pre-filters tiles before rendering - only intersecting tiles are created
-- Uses clipping to render only pixels inside the polygon (more efficient)
+- **Pre-filters tiles before rendering** - only intersecting tiles are created
+- **Uses clipping** - to render only pixels inside the polygon (more efficient)
 - **Configurable metatile size** - prevents labels from being cut off at edges
 - **Standard QGIS options** - DPI, antialiasing, tile format (PNG/JPG), background color
 - **JPEG quality control** (1-100%, default 75)
@@ -187,3 +187,4 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
+
