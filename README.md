@@ -30,7 +30,7 @@ You can find more info on how it works in the shaped_mbtiles.md file.
    - macOS: `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/`
    - Linux: `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
 
-   If you can't find it, open QGIS, go to **Plugins** → **Python Console** and run:
+   If you can't find it, open QGIS, go to **Plugins** -> **Python Console** and run:
    ```python
    from qgis.utils import plugin_dirs
    print(plugin_dirs[0])
@@ -44,7 +44,7 @@ You can find more info on how it works in the shaped_mbtiles.md file.
    - shaped_mbtiles.py
    - shaped_mbtiles_plugin.py 
 
-3. **Enable the plugin**: Restart QGIS, then go to **Plugins** → **Manage and Install Plugins** → **Installed** tab. Find "Shaped MBTiles Generator" and check the box to enable it.
+3. **Enable the plugin**: Restart QGIS, then go to **Plugins** -> **Manage and Install Plugins** → **Installed** tab. Find "Shaped MBTiles Generator" and check the box to enable it.
 
 
 ### Option 2: Direct Script Loading (No Plugin Setup)
@@ -113,6 +113,7 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
+
 
 
 
