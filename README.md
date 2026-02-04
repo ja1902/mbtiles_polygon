@@ -39,7 +39,7 @@ You can find more info on how it works in the shaped_mbtiles.md file.
 2. **Create a new folder** called `shaped_mbtiles` inside the plugins folder.
 
 3. **Download the following 4 files from this repository and place them into the shaped_mbtiles folder that you just created:**
-   - __init__.py
+   - `__init__.py`
    - metadata.txt
    - shaped_mbtiles.py
    - shaped_mbtiles_plugin.py 
@@ -113,5 +113,6 @@ A toolbar button will appear. Click it to start drawing polygons.
 - QGIS 3.0+
 - Python 3.x (included with QGIS)
 - PyQt5 (included with QGIS)
+
 
 
